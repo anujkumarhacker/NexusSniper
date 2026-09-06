@@ -38,7 +38,7 @@ WATCHLIST = [
 
 # --- PORTFOLIO HEAT & CAPITAL GOVERNORS ---
 INITIAL_CAPITAL = 5000.0            # Used for baseline HWM tracking
-RISK_PER_TRADE_PCT = 0.015          # 1.5% dynamic risk per trade (No heatmap decay)
+RISK_PER_TRADE_PCT = 0.01          # 1% dynamic risk per trade (No heatmap decay)
 MAX_CONCURRENT_POSITIONS = 10       # Global portfolio capacity
 MAX_DIRECTIONAL_POSITIONS = 10      # Max concurrent Longs or Shorts
 DEFAULT_LEVERAGE = 10               # Target leverage (auto-capped by pair tier)
