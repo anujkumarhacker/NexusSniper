@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import state_store
-import traceback
 
 app = FastAPI(title="NexusSniper Mission Control")
 
@@ -23,7 +22,7 @@ async def get_telemetry():
         bundle["analytics"] = {"win_rate": round(win_rate, 1), "profit_factor": round(pf, 2), "expectancy": round(exp, 2), "total_trades": total_trades}
         return bundle
     except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc()}
+        return {"error": str(e)}
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_ui():
@@ -33,6 +32,7 @@ async def serve_ui():
     <head>
         <meta charset="UTF-8">
         <title>NexusSniper │ Terminal</title>
+        <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
         <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -55,6 +55,7 @@ async def serve_ui():
             .table tbody tr:hover td { background-color: rgba(255,255,255,0.06) !important; }
             
             .badge-pulse { background: rgba(0,255,136,0.15); color: var(--green); border: 1px solid var(--green); padding: 5px 12px; border-radius: 6px; font-weight: 800; font-size: 0.8rem; }
+            .badge-timer { background: rgba(0,229,255,0.15); color: var(--cyan); border: 1px solid var(--cyan); padding: 5px 12px; border-radius: 6px; font-weight: 800; font-size: 0.8rem; margin-right: 10px; }
             .badge-long { background: rgba(0,255,136,0.15); color: var(--green); border: 1px solid rgba(0,255,136,0.4); padding: 3px 8px; border-radius: 4px; font-weight: bold; }
             .badge-short { background: rgba(255,51,102,0.15); color: var(--red); border: 1px solid rgba(255,51,102,0.4); padding: 3px 8px; border-radius: 4px; font-weight: bold; }
             
@@ -73,7 +74,10 @@ async def serve_ui():
                     <h3 class="fw-bold mb-0 text-white font-mono">⚡ NEXUSSNIPER (NP) TERMINAL</h3>
                     <div style="color: var(--cyan); font-weight: 800; margin-top: 5px;" class="font-mono">Institutional SMC FVG + 1:28 Trailing Ratchet Matrix</div>
                 </div>
-                <div><span class="badge-pulse font-mono">● LIVE WS PIPELINE</span></div>
+                <div class="d-flex align-items-center">
+                    <span class="badge-timer font-mono" id="candle-timer">NEXT 15M CLOSE: --:--</span>
+                    <span class="badge-pulse font-mono">● LIVE WS PIPELINE</span>
+                </div>
             </div>
 
             <!-- Top KPI Matrix -->
@@ -155,6 +159,15 @@ async def serve_ui():
             let cachedPositions = [];
             let chart = null;
             const fmt = (num, dec=4) => Number(num || 0).toFixed(dec);
+
+            function updateCountdown() {
+                const now = new Date();
+                const m = now.getUTCMinutes();
+                const s = now.getUTCSeconds();
+                const remM = 14 - (m % 15);
+                const remS = 59 - s;
+                document.getElementById('candle-timer').innerText = `NEXT 15M CLOSE: ${String(remM).padStart(2, '0')}:${String(remS).padStart(2, '0')}`;
+            }
 
             function initChart() {
                 const ctx = document.getElementById('equityChart').getContext('2d');
@@ -261,10 +274,15 @@ async def serve_ui():
                     const watch = d.watchlist || [];
                     wb.innerHTML = watch.length ? watch.map(w => {
                         let stBadge = `<span class="badge bg-secondary">${w.status}</span>`;
-                        if(w.status === 'CHOP') stBadge = `<span class="badge-chop">CHOP</span>`;
-                        else if(w.status.includes('LONG')) stBadge = `<span class="badge bg-success text-white">LONG SETUP</span>`;
-                        else if(w.status.includes('SHORT')) stBadge = `<span class="badge bg-danger text-white">SHORT SETUP</span>`;
-                        else if(w.status.includes('GTC')) stBadge = `<span class="badge bg-info text-dark">${w.status}</span>`;
+                        if(w.status === 'CHOP') {
+                            stBadge = `<span class="badge-chop">CHOP</span>`;
+                        } else if(w.status.includes('LONG')) {
+                            stBadge = `<span class="badge bg-success text-white">LONG SETUP</span>`;
+                        } else if(w.status.includes('SHORT')) {
+                            stBadge = `<span class="badge bg-danger text-white">SHORT SETUP</span>`;
+                        } else if(w.status.includes('GTC')) {
+                            stBadge = `<span class="badge bg-info text-dark">${w.status}</span>`;
+                        }
                         
                         return `<tr>
                             <td class="fw-bold text-white">${w.symbol.split('/')[0]}</td>
@@ -292,10 +310,13 @@ async def serve_ui():
                     console.error("Telemetry error:", e); 
                 }
             }
+            
             window.onload = () => { 
                 initChart(); 
                 updateTelemetry(); 
+                updateCountdown();
                 setInterval(updateTelemetry, 1500); 
+                setInterval(updateCountdown, 1000);
             };
         </script>
     </body>

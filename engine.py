@@ -1,6 +1,6 @@
 """
 NexusSniper (NP) - Master Event Loop & Supervisor
-Protected Async Event Loop, SMC Heartbeats, Clean Universe Screener, & Full Alert Hooks.
+Synchronized to Wall-Clock 15-Minute Candle Closes (:00, :15, :30, :45 UTC).
 """
 import asyncio
 import signal
@@ -38,6 +38,18 @@ def _cpu_bound_smc_eval(sym, df_1h, df_15m, df_1m):
         print(f"❌ [CPU Worker Crash] {sym}: {e}")
         return None
 
+def get_15m_bar_slot(dt):
+    """Returns a unique slot identifier for the current 15m window."""
+    minute_slot = (dt.minute // 15) * 15
+    return f"{dt.strftime('%Y-%m-%d %H')}:{minute_slot:02d}"
+
+def get_seconds_until_next_15m():
+    """Calculates remaining seconds until the next :00, :15, :30, :45 UTC mark."""
+    now = datetime.now(timezone.utc)
+    rem_min = 14 - (now.minute % 15)
+    rem_sec = 59 - now.second
+    return (rem_min * 60) + rem_sec
+
 class NexusSniperEngine:
     def __init__(self):
         self.mesh = NetworkMesh()
@@ -47,13 +59,15 @@ class NexusSniperEngine:
         self.tracked_symbols = []
         self.current_ers = {}
         self.cpu_pool = ProcessPoolExecutor(max_workers=max(1, os.cpu_count() - 1))
-        self.cb_active_state = False # Local toggle to prevent alert spam
+        self.cb_active_state = False 
+        self.last_scanned_bar_slot = None
 
     async def initialize(self):
         try:
             state_store.init_db()
             await self.mesh.initialize()
             
+            # 1. Screen initial universe
             await self.screen_universe()
             
             watchlist_payload = [{'symbol': sym, 'er': 0.0, 'price': 0.0, 'status': 'INITIALIZING'} for sym in self.tracked_symbols]
@@ -64,8 +78,22 @@ class NexusSniperEngine:
             print(f"✅ {msg}")
             state_store.log(msg)
             
-            # --- NEW: PUSH STARTUP ALERT TO TELEGRAM ---
             await telegram_notifier.send_alert(telegram_notifier.format_startup_alert(len(self.tracked_symbols)))
+
+            # 2. IMMEDIATE BOOTSTRAP SCAN: Audit the most recently closed 15m bar right away
+            print("\n⚡ [BOOTSTRAP] Performing immediate audit of the most recently closed 15m candle...")
+            bal = await self.mesh.rest_exchange.fetch_balance()
+            equity = float(bal.get('USDT', {}).get('total', config.INITIAL_CAPITAL))
+            free_margin = float(bal.get('USDT', {}).get('free', config.INITIAL_CAPITAL))
+            loop = asyncio.get_running_loop()
+            
+            await self.scan_for_setups(equity, free_margin, [], loop)
+            
+            # Mark current slot so we don't re-scan until the next candle close
+            self.last_scanned_bar_slot = get_15m_bar_slot(datetime.now(timezone.utc))
+            
+            rem_secs = get_seconds_until_next_15m()
+            print(f"⏳ Bootstrap complete. Next synchronized scan in {rem_secs // 60}m {rem_secs % 60}s (at the 15m candle close).\n")
 
         except Exception as e:
             print(f"❌ Initialization Error: {e}\n{traceback.format_exc()}")
@@ -118,11 +146,8 @@ class NexusSniperEngine:
             self.tracked_symbols = fallback
 
     async def run(self):
-        last_rebalance = time.time()
-        last_telemetry = time.time()
         last_heartbeat = time.time()
         loop = asyncio.get_running_loop()
-        rebalance_interval_secs = getattr(config, 'REBALANCE_INTERVAL_MINS', 15) * 60
         
         try:
             while not shutdown_event.is_set():
@@ -131,15 +156,16 @@ class NexusSniperEngine:
                     equity = float(bal.get('USDT', {}).get('total', config.INITIAL_CAPITAL))
                     free_margin = float(bal.get('USDT', {}).get('free', config.INITIAL_CAPITAL))
                 except Exception as e:
-                    err_msg = str(e)
-                    print(f"⚠️ API Rejection on Balance Fetch. Check API Keys! Error: {err_msg[:100]}...")
-                    await asyncio.sleep(5.0)
+                    print(f"⚠️ API Rejection on Balance Fetch: {str(e)[:80]}...")
+                    await asyncio.sleep(4.0)
                     continue
 
                 healthy, cb_msg = self.risk_gov.evaluate_circuit_breakers(equity)
-                state_store.update_global_state(equity, free_margin, self.risk_gov.peak_equity, cb_msg, self.risk_gov.consecutive_losses, self.risk_gov.cb_locked_until)
+                state_store.update_global_state(
+                    equity, free_margin, self.risk_gov.peak_equity,
+                    cb_msg, self.risk_gov.consecutive_losses, self.risk_gov.cb_locked_until
+                )
 
-                # --- NEW: PUSH CIRCUIT BREAKER ALERTS TO TELEGRAM ---
                 if not healthy and not self.cb_active_state:
                     self.cb_active_state = True
                     await telegram_notifier.send_alert(telegram_notifier.format_cb_alert(cb_msg, config.CIRCUIT_BREAKER_LOCKOUT_HOURS))
@@ -147,24 +173,28 @@ class NexusSniperEngine:
                     self.cb_active_state = False
                     await telegram_notifier.send_alert(telegram_notifier.format_cb_lifted_alert())
 
+                # Evaluate active position stops and pending limit order expiry every tick
                 await self.router.evaluate_gtc_cancellations(self.pending_entries, self.current_ers)
                 await self.manage_active_positions(equity)
-
                 active_pos = state_store.get_all_active_positions()
-                if healthy and len(active_pos) < config.MAX_CONCURRENT_POSITIONS:
-                    await self.scan_for_setups(equity, free_margin, active_pos, loop)
 
-                if (time.time() - last_heartbeat) >= 15:
-                    last_heartbeat = time.time()
-                    print(f"⚙️ [SMC ENGINE] Cycle Complete. Tracking {len(self.tracked_symbols)} pairs. Pending FVG Entries: {len(self.pending_entries)}. Active: {len(active_pos)}. State: {cb_msg}")
+                # --- 15-MINUTE CANDLE CLOSE SYNCHRONIZATION (:00, :15, :30, :45 UTC) ---
+                now_utc = datetime.now(timezone.utc)
+                current_slot = get_15m_bar_slot(now_utc)
+                
+                # Check if we are at the close of a 15m candle (second >= 2 provides exchange finalization buffer)
+                is_candle_close = (now_utc.minute % 15 == 0) and (now_utc.second >= 2)
 
-                if (time.time() - last_telemetry) >= 900:
-                    last_telemetry = time.time()
-                    await self.broadcast_telemetry(equity, active_pos)
+                if is_candle_close and (current_slot != self.last_scanned_bar_slot):
+                    self.last_scanned_bar_slot = current_slot
+                    formatted_time = now_utc.strftime('%H:%M:%S UTC')
+                    print(f"\n🔔 [15M CANDLE CLOSE DETECTED: {formatted_time}]")
+                    state_store.log(f"15m Candle Close at {now_utc.strftime('%H:%M')} UTC. Executing Synchronized Audit...")
 
-                if (time.time() - last_rebalance) >= rebalance_interval_secs:
-                    last_rebalance = time.time()
+                    # 1. Rebalance universe
                     await self.screen_universe()
+                    
+                    # 2. Cancel pending GTC orders for pairs that dropped out of the universe
                     for sym in list(self.pending_entries.keys()):
                         if sym not in self.tracked_symbols:
                             try:
@@ -172,7 +202,21 @@ class NexusSniperEngine:
                             except Exception: pass
                             del self.pending_entries[sym]
 
-                await asyncio.sleep(2.0)
+                    # 3. Scan the completed 15m candle across all pairs
+                    if healthy and len(active_pos) < config.MAX_CONCURRENT_POSITIONS:
+                        await self.scan_for_setups(equity, free_margin, active_pos, loop)
+
+                    # 4. Push the synchronized 15-minute telemetry digest to Telegram
+                    await self.broadcast_telemetry(equity, active_pos)
+
+                # --- LIVE HEARTBEAT & COUNTDOWN LOGGER ---
+                if (time.time() - last_heartbeat) >= 20:
+                    last_heartbeat = time.time()
+                    rem_secs = get_seconds_until_next_15m()
+                    mins, secs = divmod(rem_secs, 60)
+                    print(f"⚙️ [SMC ENGINE] Active: {len(active_pos)} | Pending GTC: {len(self.pending_entries)} | Next 15m Candle Close in: {mins:02d}m {secs:02d}s")
+
+                await asyncio.sleep(1.5)
                 
         except asyncio.CancelledError:
             pass
@@ -195,8 +239,7 @@ class NexusSniperEngine:
                 self.mesh.fetch_ohlcv_hybrid(sym, config.TIMEFRAME_ENTRY, limit=30)
             )
         
-        if not fetch_tasks: 
-            return
+        if not fetch_tasks: return
             
         fetched_data = {}
         for sym, task in fetch_tasks.items():
@@ -365,10 +408,11 @@ class NexusSniperEngine:
         await telegram_notifier.send_alert(telegram_notifier.format_closed_alert(sym, outcome, net_pnl, r_mult, exit_px, current_equity))
 
     async def broadcast_telemetry(self, equity, active_positions):
+        now_time = datetime.now(timezone.utc).strftime('%H:%M UTC')
         if not active_positions:
-            msg = f"📡 <b>15-MIN PORTFOLIO TELEMETRY</b>\n━━━━━━━━━━━━━━━━━━━━\n💰 <b>Equity:</b> <code>${equity:,.2f}</code>\n📦 <b>Active Trades:</b> <code>0/{config.MAX_CONCURRENT_POSITIONS}</code>\n⚡ <i>Scanning universe for FVG sweeps...</i>"
+            msg = f"📡 <b>15-MIN PORTFOLIO TELEMETRY ({now_time})</b>\n━━━━━━━━━━━━━━━━━━━━\n💰 <b>Equity:</b> <code>${equity:,.2f}</code>\n📦 <b>Active Trades:</b> <code>0/{config.MAX_CONCURRENT_POSITIONS}</code>\n⚡ <i>15m candle closed. Scanning universe for FVG setups...</i>"
         else:
-            msg = f"📡 <b>15-MIN PORTFOLIO TELEMETRY</b>\n━━━━━━━━━━━━━━━━━━━━\n💰 <b>Equity:</b> <code>${equity:,.2f}</code>\n📦 <b>Active Trades:</b> <code>{len(active_positions)}/{config.MAX_CONCURRENT_POSITIONS}</code>\n\n"
+            msg = f"📡 <b>15-MIN PORTFOLIO TELEMETRY ({now_time})</b>\n━━━━━━━━━━━━━━━━━━━━\n💰 <b>Equity:</b> <code>${equity:,.2f}</code>\n📦 <b>Active Trades:</b> <code>{len(active_positions)}/{config.MAX_CONCURRENT_POSITIONS}</code>\n\n"
             for p in active_positions:
                 icon = "🟢" if p['side'] == 'long' else "🔴"
                 msg += f"{icon} <b>{p['symbol'].split('/')[0]}</b> ({p['side'].upper()}) │ Multiple: <code>{p.get('r_multiple', 0.0):+.2f}R</code>\n"
