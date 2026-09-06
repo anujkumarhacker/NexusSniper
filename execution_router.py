@@ -2,6 +2,7 @@ import asyncio
 import time
 import config
 import state_store
+import telegram_notifier
 
 class ExecutionRouter:
     def __init__(self, mesh, risk_gov):
@@ -42,6 +43,10 @@ class ExecutionRouter:
         try:
             order = await exchange.create_order(sym, 'LIMIT', order_side, float(qty_str), float(px_str), params={'timeInForce': 'GTC'})
             state_store.log(f"⚡ GTC Entry Deployed: {sym} {order_side.upper()} {qty_str} @ ${px_str}")
+            
+            # --- NEW: PUSH GTC ALERT TO TELEGRAM ---
+            await telegram_notifier.send_alert(telegram_notifier.format_gtc_placed_alert(sym, side, float(px_str)))
+            
             return {
                 'order_id': order['id'], 'symbol': sym, 'side': side, 'size': float(qty_str),
                 'entry_price': float(px_str), 'stop_distance': stop_dist, 'initial_sl': setup['stop_loss'],
@@ -69,6 +74,8 @@ class ExecutionRouter:
                 try:
                     await self.mesh.rest_exchange.cancel_order(entry['order_id'], sym)
                     state_store.log(f"🚫 GTC Entry Revoked: {sym} - Reason: {cancel_reason}")
+                    # --- NEW: PUSH CANCEL ALERT TO TELEGRAM ---
+                    await telegram_notifier.send_alert(telegram_notifier.format_gtc_cancelled_alert(sym, cancel_reason))
                 except Exception as e:
                     state_store.log(f"Failed to cancel GTC order for {sym}: {e}", "WARN")
                 del pending_entries[sym]

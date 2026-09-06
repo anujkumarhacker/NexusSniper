@@ -1,6 +1,6 @@
 """
 NexusSniper (NP) - Master Event Loop & Supervisor
-Protected Async Event Loop, SMC Heartbeats, and Clean Universe Screener.
+Protected Async Event Loop, SMC Heartbeats, Clean Universe Screener, & Full Alert Hooks.
 """
 import asyncio
 import signal
@@ -47,13 +47,13 @@ class NexusSniperEngine:
         self.tracked_symbols = []
         self.current_ers = {}
         self.cpu_pool = ProcessPoolExecutor(max_workers=max(1, os.cpu_count() - 1))
+        self.cb_active_state = False # Local toggle to prevent alert spam
 
     async def initialize(self):
         try:
             state_store.init_db()
             await self.mesh.initialize()
             
-            # Run the dynamic Nexus Screener
             await self.screen_universe()
             
             watchlist_payload = [{'symbol': sym, 'er': 0.0, 'price': 0.0, 'status': 'INITIALIZING'} for sym in self.tracked_symbols]
@@ -63,12 +63,15 @@ class NexusSniperEngine:
             msg = "Supervisor initialized. Entering unified asynchronous event loop."
             print(f"✅ {msg}")
             state_store.log(msg)
+            
+            # --- NEW: PUSH STARTUP ALERT TO TELEGRAM ---
+            await telegram_notifier.send_alert(telegram_notifier.format_startup_alert(len(self.tracked_symbols)))
+
         except Exception as e:
             print(f"❌ Initialization Error: {e}\n{traceback.format_exc()}")
             raise
 
     async def screen_universe(self):
-        """Screens Binance USD(S)-M Futures for the Top 20 valid pairs."""
         try:
             tickers = await self.mesh.rest_exchange.fetch_tickers()
             btc_sym = 'BTC/USDT:USDT' if 'BTC/USDT:USDT' in tickers else 'BTC/USDT'
@@ -79,21 +82,14 @@ class NexusSniperEngine:
 
             valid_candidates = []
             for sym, t in tickers.items():
-                if config.BASE_QUOTE not in sym or 'BTC' in sym: 
-                    continue
+                if config.BASE_QUOTE not in sym or 'BTC' in sym: continue
                 
-                # STRICT REGEX: Kills fake testnet pairs with Chinese chars or weird lengths
                 base_ticker = sym.replace('/', '').split(':')[0]
-                if not re.match(r'^[A-Z0-9]{3,12}USDT$', base_ticker):
-                    continue
+                if not re.match(r'^[A-Z0-9]{3,12}USDT$', base_ticker): continue
 
                 quote_vol = float(t.get('quoteVolume') or t.get('baseVolume') or 0.0)
                 pct_chg = float(t.get('percentage') or 0.0)
-                valid_candidates.append({
-                    'symbol': sym,
-                    'volume': quote_vol,
-                    'rs_score': pct_chg - btc_chg
-                })
+                valid_candidates.append({'symbol': sym, 'volume': quote_vol, 'rs_score': pct_chg - btc_chg})
 
             filtered = [c for c in valid_candidates if c['volume'] >= vol_threshold]
 
@@ -102,27 +98,23 @@ class NexusSniperEngine:
                 filtered = valid_candidates[:max(top_target * 2, 40)]
 
             filtered.sort(key=lambda x: x['rs_score'], reverse=True)
-
             half = top_target // 2
             top_longs = [c['symbol'] for c in filtered[:half]]
             top_shorts = [c['symbol'] for c in filtered[-half:]]
 
             selected = list(dict.fromkeys(top_longs + top_shorts))
-            if btc_sym not in selected:
-                selected.append(btc_sym)
+            if btc_sym not in selected: selected.append(btc_sym)
 
             self.tracked_symbols = selected
             log_msg = f"Nexus SMC Screener Locked {len(self.tracked_symbols)} valid pairs (10 Long RS + 10 Short RS + BTC)."
             print(f"🔍 {log_msg}")
             state_store.log(log_msg)
-
         except Exception as e:
             err_msg = f"Screener Exception: {e}. Falling back to config.WATCHLIST"
             print(f"⚠️ {err_msg}")
             state_store.log(err_msg, "WARN")
             fallback = [f"{s.replace('USDT', '')}/USDT:USDT" for s in config.WATCHLIST]
-            if 'BTC/USDT:USDT' not in fallback:
-                fallback.append('BTC/USDT:USDT')
+            if 'BTC/USDT:USDT' not in fallback: fallback.append('BTC/USDT:USDT')
             self.tracked_symbols = fallback
 
     async def run(self):
@@ -139,17 +131,21 @@ class NexusSniperEngine:
                     equity = float(bal.get('USDT', {}).get('total', config.INITIAL_CAPITAL))
                     free_margin = float(bal.get('USDT', {}).get('free', config.INITIAL_CAPITAL))
                 except Exception as e:
-                    # Extracts exact API rejection message so user can fix testnet keys
                     err_msg = str(e)
                     print(f"⚠️ API Rejection on Balance Fetch. Check API Keys! Error: {err_msg[:100]}...")
                     await asyncio.sleep(5.0)
                     continue
 
                 healthy, cb_msg = self.risk_gov.evaluate_circuit_breakers(equity)
-                state_store.update_global_state(
-                    equity, free_margin, self.risk_gov.peak_equity,
-                    cb_msg, self.risk_gov.consecutive_losses, self.risk_gov.cb_locked_until
-                )
+                state_store.update_global_state(equity, free_margin, self.risk_gov.peak_equity, cb_msg, self.risk_gov.consecutive_losses, self.risk_gov.cb_locked_until)
+
+                # --- NEW: PUSH CIRCUIT BREAKER ALERTS TO TELEGRAM ---
+                if not healthy and not self.cb_active_state:
+                    self.cb_active_state = True
+                    await telegram_notifier.send_alert(telegram_notifier.format_cb_alert(cb_msg, config.CIRCUIT_BREAKER_LOCKOUT_HOURS))
+                elif healthy and self.cb_active_state:
+                    self.cb_active_state = False
+                    await telegram_notifier.send_alert(telegram_notifier.format_cb_lifted_alert())
 
                 await self.router.evaluate_gtc_cancellations(self.pending_entries, self.current_ers)
                 await self.manage_active_positions(equity)
@@ -158,7 +154,6 @@ class NexusSniperEngine:
                 if healthy and len(active_pos) < config.MAX_CONCURRENT_POSITIONS:
                     await self.scan_for_setups(equity, free_margin, active_pos, loop)
 
-                # --- LIVE HEARTBEAT LOGGER ---
                 if (time.time() - last_heartbeat) >= 15:
                     last_heartbeat = time.time()
                     print(f"⚙️ [SMC ENGINE] Cycle Complete. Tracking {len(self.tracked_symbols)} pairs. Pending FVG Entries: {len(self.pending_entries)}. Active: {len(active_pos)}. State: {cb_msg}")
@@ -207,10 +202,8 @@ class NexusSniperEngine:
         for sym, task in fetch_tasks.items():
             try:
                 res = await task
-                if not any(df.empty for df in res): 
-                    fetched_data[sym] = res
-            except Exception: 
-                pass
+                if not any(df.empty for df in res): fetched_data[sym] = res
+            except Exception: pass
 
         eval_tasks = []
         for sym, (df_1h, df_15m, df_1m) in fetched_data.items():
@@ -220,8 +213,7 @@ class NexusSniperEngine:
         
         watchlist_payload = []
         for sym, setup in zip(fetched_data.keys(), results):
-            if isinstance(setup, Exception): 
-                continue
+            if isinstance(setup, Exception): continue
                 
             live_px = self.mesh.get_live_price(sym) or 0.0
             er_val = self.current_ers.get(sym, 0.0)
