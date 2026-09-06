@@ -30,7 +30,6 @@ class NetworkMesh:
         })
 
         if config.USE_TESTNET:
-            # FIXED: CCXT syntax for Binance Demo testnet (bypasses sandbox crash)
             self.ws_exchange.enable_demo_trading(True)
             self.rest_exchange.enable_demo_trading(True)
 
@@ -39,15 +38,19 @@ class NetworkMesh:
         state_store.log("Network Mesh connected to Binance.")
 
     async def start_ticker_stream(self, symbols):
+        backoff = 2
         while True:
             try:
                 tickers = await self.ws_exchange.watch_tickers(symbols)
                 for sym, t in tickers.items():
                     if t.get('last') is not None:
                         self.live_tickers[sym] = float(t['last'])
+                backoff = 2 # reset on success
             except Exception as e:
-                state_store.log(f"WS Ticker Stream hiccup: {e}. Reconnecting...", "WARN")
-                await asyncio.sleep(2)
+                # FIX 12: Exponential backoff
+                state_store.log(f"WS Ticker Stream hiccup: {e}. Reconnecting in {backoff}s...", "WARN")
+                await asyncio.sleep(backoff)
+                backoff = min(60, backoff * 2)
 
     async def fetch_ohlcv_hybrid(self, symbol, timeframe, limit=100):
         try:
@@ -59,7 +62,6 @@ class NetworkMesh:
             try:
                 ohlcv = await self.rest_exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             except Exception as rest_err:
-                state_store.log(f"OHLCV fetch failed for {symbol}: {rest_err}", "ERROR")
                 return pd.DataFrame()
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])

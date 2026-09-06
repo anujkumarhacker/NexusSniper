@@ -1,6 +1,6 @@
 """
 NexusSniper (NP) - Master Event Loop & Supervisor
-Synchronized to Wall-Clock 15-Minute Candle Closes (:00, :15, :30, :45 UTC).
+Protected Async Event Loop with Full State Recovery and Validation.
 """
 import asyncio
 import signal
@@ -39,12 +39,10 @@ def _cpu_bound_smc_eval(sym, df_1h, df_15m, df_1m):
         return None
 
 def get_15m_bar_slot(dt):
-    """Returns a unique slot identifier for the current 15m window."""
     minute_slot = (dt.minute // 15) * 15
     return f"{dt.strftime('%Y-%m-%d %H')}:{minute_slot:02d}"
 
 def get_seconds_until_next_15m():
-    """Calculates remaining seconds until the next :00, :15, :30, :45 UTC mark."""
     now = datetime.now(timezone.utc)
     rem_min = 14 - (now.minute % 15)
     rem_sec = 59 - now.second
@@ -67,7 +65,16 @@ class NexusSniperEngine:
             state_store.init_db()
             await self.mesh.initialize()
             
-            # 1. Screen initial universe
+            # FIX 1: Restore Risk State from DB
+            risk_state = state_store.load_risk_state()
+            if risk_state:
+                self.risk_gov.restore_state(risk_state['peak_equity'], risk_state['consecutive_losses'], risk_state['cb_locked_until'])
+
+            # FIX 3: Restore Pending GTC Entries from DB
+            self.pending_entries = state_store.get_all_pending_entries()
+            if self.pending_entries:
+                print(f"🔄 Recovered {len(self.pending_entries)} pending GTC orders from database.")
+
             await self.screen_universe()
             
             watchlist_payload = [{'symbol': sym, 'er': 0.0, 'price': 0.0, 'status': 'INITIALIZING'} for sym in self.tracked_symbols]
@@ -80,7 +87,6 @@ class NexusSniperEngine:
             
             await telegram_notifier.send_alert(telegram_notifier.format_startup_alert(len(self.tracked_symbols)))
 
-            # 2. IMMEDIATE BOOTSTRAP SCAN: Audit the most recently closed 15m bar right away
             print("\n⚡ [BOOTSTRAP] Performing immediate audit of the most recently closed 15m candle...")
             bal = await self.mesh.rest_exchange.fetch_balance()
             equity = float(bal.get('USDT', {}).get('total', config.INITIAL_CAPITAL))
@@ -89,7 +95,6 @@ class NexusSniperEngine:
             
             await self.scan_for_setups(equity, free_margin, [], loop)
             
-            # Mark current slot so we don't re-scan until the next candle close
             self.last_scanned_bar_slot = get_15m_bar_slot(datetime.now(timezone.utc))
             
             rem_secs = get_seconds_until_next_15m()
@@ -173,16 +178,13 @@ class NexusSniperEngine:
                     self.cb_active_state = False
                     await telegram_notifier.send_alert(telegram_notifier.format_cb_lifted_alert())
 
-                # Evaluate active position stops and pending limit order expiry every tick
                 await self.router.evaluate_gtc_cancellations(self.pending_entries, self.current_ers)
                 await self.manage_active_positions(equity)
                 active_pos = state_store.get_all_active_positions()
 
-                # --- 15-MINUTE CANDLE CLOSE SYNCHRONIZATION (:00, :15, :30, :45 UTC) ---
                 now_utc = datetime.now(timezone.utc)
                 current_slot = get_15m_bar_slot(now_utc)
                 
-                # Check if we are at the close of a 15m candle (second >= 2 provides exchange finalization buffer)
                 is_candle_close = (now_utc.minute % 15 == 0) and (now_utc.second >= 2)
 
                 if is_candle_close and (current_slot != self.last_scanned_bar_slot):
@@ -191,25 +193,21 @@ class NexusSniperEngine:
                     print(f"\n🔔 [15M CANDLE CLOSE DETECTED: {formatted_time}]")
                     state_store.log(f"15m Candle Close at {now_utc.strftime('%H:%M')} UTC. Executing Synchronized Audit...")
 
-                    # 1. Rebalance universe
                     await self.screen_universe()
                     
-                    # 2. Cancel pending GTC orders for pairs that dropped out of the universe
-                    for sym in list(self.pending_entries.keys()):
-                        if sym not in self.tracked_symbols:
+                    for sym in list(self.pending_entries.items()):
+                        if sym[0] not in self.tracked_symbols:
                             try:
-                                await self.mesh.rest_exchange.cancel_order(self.pending_entries[sym]['order_id'], sym)
+                                await self.mesh.rest_exchange.cancel_order(sym[1]['order_id'], sym[0])
                             except Exception: pass
-                            del self.pending_entries[sym]
+                            del self.pending_entries[sym[0]]
+                            state_store.remove_pending_entry(sym[0])
 
-                    # 3. Scan the completed 15m candle across all pairs
                     if healthy and len(active_pos) < config.MAX_CONCURRENT_POSITIONS:
                         await self.scan_for_setups(equity, free_margin, active_pos, loop)
 
-                    # 4. Push the synchronized 15-minute telemetry digest to Telegram
                     await self.broadcast_telemetry(equity, active_pos)
 
-                # --- LIVE HEARTBEAT & COUNTDOWN LOGGER ---
                 if (time.time() - last_heartbeat) >= 20:
                     last_heartbeat = time.time()
                     rem_secs = get_seconds_until_next_15m()
@@ -259,15 +257,13 @@ class NexusSniperEngine:
             if isinstance(setup, Exception): continue
                 
             live_px = self.mesh.get_live_price(sym) or 0.0
-            er_val = self.current_ers.get(sym, 0.0)
-            try:
-                c = fetched_data[sym][0]['close'].to_numpy()
-                if len(c) > config.ER_PERIOD:
-                    nc = abs(c[-1] - c[-config.ER_PERIOD])
-                    sc = sum(abs(np.diff(c[-config.ER_PERIOD:])))
-                    er_val = nc / sc if sc > 0 else 0.0
-            except Exception: pass
             
+            # FIX 8: Unified ER calc
+            try:
+                er_val = SMCEngine.calculate_efficiency_ratio(fetched_data[sym][0]['close'].iloc[:-1])
+            except Exception:
+                er_val = 0.0
+                
             self.current_ers[sym] = er_val
             
             if er_val < config.ER_TREND_THRESHOLD: status = "CHOP"
@@ -302,6 +298,24 @@ class NexusSniperEngine:
                 actual_entry = float(pos.get('entryPrice', pending['entry_price']))
                 actual_size = float(pos.get('contracts', pending['size']))
                 
+                # FIX 5: Partial GTC fills aren't handled
+                if actual_size < pending['size']:
+                    print(f"⚠️ Partial fill detected on {sym} ({actual_size}/{pending['size']}). Cancelling remainder.")
+                    try:
+                        await self.mesh.rest_exchange.cancel_order(pending['order_id'], sym)
+                    except Exception as e:
+                        print(f"Failed to cancel remainder of {sym} GTC: {e}")
+
+                # FIX 2: A failed initial stop loss placement is invisible
+                sl_id = await self.router.place_layered_stop(sym, pending['side'], actual_size, pending['initial_sl'], 'INITIAL_SL')
+                if not sl_id:
+                    print(f"🚨 CRITICAL: Initial Stop placement failed for {sym}. Leaving in pending state to retry.")
+                    state_store.log(f"Initial SL failed for {sym}. Position unprotected. Retrying.", "ERROR")
+                    continue
+                
+                # FIX 9: Terminal Take profit real order
+                await self.router.place_terminal_tp(sym, pending['side'], actual_size, pending['target_tp'])
+
                 new_pos_record = {
                     'symbol': sym, 'side': pending['side'], 'size': actual_size,
                     'entry_price': actual_entry, 'stop_distance': pending['stop_distance'],
@@ -310,11 +324,12 @@ class NexusSniperEngine:
                     'leverage': pending['leverage'], 'open_time': time.time()
                 }
                 
-                print(f"🚀 POS FILLED: {sym} {pending['side'].upper()} | Entry: {actual_entry}")
-                await self.router.place_layered_stop(sym, pending['side'], actual_size, pending['initial_sl'], 'INITIAL_SL')
+                print(f"🚀 POS FILLED & PROTECTED: {sym} {pending['side'].upper()} | Entry: {actual_entry}")
                 state_store.save_position(new_pos_record)
                 await telegram_notifier.send_alert(telegram_notifier.format_entry_alert(new_pos_record))
+                
                 del self.pending_entries[sym]
+                state_store.remove_pending_entry(sym)
 
         db_positions = state_store.get_all_active_positions()
         for p in db_positions:
@@ -335,37 +350,43 @@ class NexusSniperEngine:
             r_gain = (live_px - entry) / dist if is_long else (entry - live_px) / dist
             p['r_multiple'] = r_gain
 
+            # FIX 4: Ratchet stop discarded return value
             try:
                 if r_gain >= config.RATCHET_4_TRIGGER_R and not p['lock4_hit']:
                     sl = entry + (dist * config.RATCHET_4_LOCK_R) if is_long else entry - (dist * config.RATCHET_4_LOCK_R)
-                    p['current_sl'] = sl; p['lock4_hit'] = 1
-                    await self.router.place_layered_stop(sym, side, p['size'], sl, 'LOCK_17R')
-                    await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "17R LOCK", r_gain, dist * 17.0 * p['size']))
+                    if await self.router.place_layered_stop(sym, side, p['size'], sl, 'LOCK_17R'):
+                        p['current_sl'] = sl
+                        p['lock4_hit'] = 1
+                        await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "17R LOCK", r_gain, dist * 17.0 * p['size']))
 
                 elif r_gain >= config.RATCHET_3_TRIGGER_R and not p['lock3_hit']:
                     sl = entry + (dist * config.RATCHET_3_LOCK_R) if is_long else entry - (dist * config.RATCHET_3_LOCK_R)
-                    p['current_sl'] = sl; p['lock3_hit'] = 1
-                    await self.router.place_layered_stop(sym, side, p['size'], sl, 'LOCK_12R')
-                    await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "12R LOCK", r_gain, dist * 12.0 * p['size']))
+                    if await self.router.place_layered_stop(sym, side, p['size'], sl, 'LOCK_12R'):
+                        p['current_sl'] = sl
+                        p['lock3_hit'] = 1
+                        await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "12R LOCK", r_gain, dist * 12.0 * p['size']))
 
                 elif r_gain >= config.RATCHET_2_TRIGGER_R and not p['lock2_hit']:
                     sl = entry + (dist * config.RATCHET_2_LOCK_R) if is_long else entry - (dist * config.RATCHET_2_LOCK_R)
-                    p['current_sl'] = sl; p['lock2_hit'] = 1
-                    await self.router.place_layered_stop(sym, side, p['size'], sl, 'LOCK_7R')
-                    await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "7R LOCK", r_gain, dist * 7.0 * p['size']))
+                    if await self.router.place_layered_stop(sym, side, p['size'], sl, 'LOCK_7R'):
+                        p['current_sl'] = sl
+                        p['lock2_hit'] = 1
+                        await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "7R LOCK", r_gain, dist * 7.0 * p['size']))
 
                 elif r_gain >= config.RATCHET_1_TRIGGER_R and not p['lock1_hit']:
                     sl = entry + (dist * config.RATCHET_1_LOCK_R) if is_long else entry - (dist * config.RATCHET_1_LOCK_R)
-                    p['current_sl'] = sl; p['lock1_hit'] = 1
-                    await self.router.place_layered_stop(sym, side, p['size'], sl, 'LOCK_2.5R')
-                    await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "2.5R LOCK", r_gain, dist * 2.5 * p['size']))
+                    if await self.router.place_layered_stop(sym, side, p['size'], sl, 'LOCK_2.5R'):
+                        p['current_sl'] = sl
+                        p['lock1_hit'] = 1
+                        await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "2.5R LOCK", r_gain, dist * 2.5 * p['size']))
 
                 elif r_gain >= config.BE_TRIGGER_R and not p['be_hit']:
                     buffer = entry * 0.0004
                     sl = entry + buffer if is_long else entry - buffer
-                    p['current_sl'] = sl; p['be_hit'] = 1
-                    await self.router.place_layered_stop(sym, side, p['size'], sl, 'BREAKEVEN')
-                    await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "BREAKEVEN", r_gain, 0.0))
+                    if await self.router.place_layered_stop(sym, side, p['size'], sl, 'BREAKEVEN'):
+                        p['current_sl'] = sl
+                        p['be_hit'] = 1
+                        await telegram_notifier.send_alert(telegram_notifier.format_ratchet_alert(p, "BREAKEVEN", r_gain, 0.0))
 
                 state_store.save_position(p)
             except Exception as e:
@@ -388,7 +409,8 @@ class NexusSniperEngine:
                 'limit': 20
             })
             for item in income:
-                if item.get('asset') == 'USDT':
+                # FIX 11: Only count realized PnL (excludes funding fees)
+                if item.get('asset') == 'USDT' and item.get('incomeType') == 'REALIZED_PNL':
                     net_pnl += float(item.get('income', 0.0))
         except Exception:
             gross = (exit_px - pos['entry_price']) * pos['size'] if pos['side'] == 'long' else (pos['entry_price'] - exit_px) * pos['size']

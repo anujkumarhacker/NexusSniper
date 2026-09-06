@@ -56,7 +56,7 @@ TIMEFRAME_SETUP = "15m"
 TIMEFRAME_ENTRY = "1m"
 
 ER_PERIOD = 14                      # Kaufman Efficiency Ratio lookback
-ER_TREND_THRESHOLD = 0.25           # Market regime floor (ER >= 0.25 required)
+ER_TREND_THRESHOLD = 0.35           # Market regime floor (ER >= 0.25 required)
 SWEEP_MIN_DEPTH_PCT = 0.0008        # 0.08% minimum penetration beyond 15m fractal
 FRACTAL_WINDOW = 3                  # Fractal detection window (n=3)
 

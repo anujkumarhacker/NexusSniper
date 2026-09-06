@@ -26,8 +26,8 @@ def init_db():
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS pending_entries (
-        symbol TEXT PRIMARY KEY, order_id TEXT, side TEXT, entry_price REAL, stop_loss REAL,
-        risk_distance REAL, placed_time REAL, target_5r REAL
+        symbol TEXT PRIMARY KEY, order_id TEXT, side TEXT, size REAL, entry_price REAL, stop_loss REAL,
+        risk_distance REAL, placed_time REAL, target_5r REAL, target_price REAL, margin_locked REAL, leverage INTEGER
     )""")
 
     c.execute("""CREATE TABLE IF NOT EXISTS closed_trades (
@@ -55,6 +55,17 @@ def log(msg, level="INFO"):
         conn.commit()
         conn.close()
     except Exception: pass
+
+# --- FIX 1: Restore Risk State ---
+def load_risk_state():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        row = c.execute("SELECT peak_equity, consecutive_losses, cb_locked_until FROM bot_state ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception: return None
 
 def update_global_state(equity, free_margin, peak_eq, status, losses, cb_until):
     try:
@@ -84,6 +95,48 @@ def remove_position(symbol):
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("DELETE FROM active_positions WHERE symbol=?", (symbol,))
+        conn.commit()
+        conn.close()
+    except Exception: pass
+
+# --- FIX 3: GTC State Persistence ---
+def save_pending_entry(entry):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""INSERT OR REPLACE INTO pending_entries 
+            (symbol, order_id, side, size, entry_price, stop_loss, risk_distance, placed_time, target_5r, target_price, margin_locked, leverage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (entry['symbol'], entry['order_id'], entry['side'], entry['size'], entry['entry_price'], entry['initial_sl'], entry['stop_distance'], entry['placed_time'], entry['target_5r'], entry['target_tp'], entry['margin_locked'], entry['leverage']))
+        conn.commit()
+        conn.close()
+    except Exception as e: log(f"Failed to save pending entry {entry['symbol']}: {e}", "ERROR")
+
+def get_all_pending_entries():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        rows = c.execute("SELECT * FROM pending_entries").fetchall()
+        conn.close()
+        
+        # Translate back to memory dict format
+        pending = {}
+        for r in rows:
+            pending[r['symbol']] = {
+                'order_id': r['order_id'], 'symbol': r['symbol'], 'side': r['side'], 'size': r['size'],
+                'entry_price': r['entry_price'], 'stop_distance': r['risk_distance'], 'initial_sl': r['stop_loss'],
+                'target_5r': r['target_5r'], 'target_tp': r['target_price'], 'margin_locked': r['margin_locked'],
+                'leverage': r['leverage'], 'placed_time': r['placed_time']
+            }
+        return pending
+    except Exception: return {}
+
+def remove_pending_entry(symbol):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM pending_entries WHERE symbol=?", (symbol,))
         conn.commit()
         conn.close()
     except Exception: pass
@@ -147,7 +200,7 @@ def update_watchlist(watchlist_data):
                       (data['symbol'], data['er'], data['price'], data['status']))
         conn.commit()
         conn.close()
-    except Exception as e: log(f"Watchlist update error: {e}")
+    except Exception: pass
 
 def get_telemetry_bundle():
     data = {"state": {}, "positions": [], "closed_trades": [], "logs": [], "watchlist": []}
@@ -155,10 +208,8 @@ def get_telemetry_bundle():
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        
         st = c.execute("SELECT * FROM bot_state ORDER BY id DESC LIMIT 1").fetchone()
         if st: data["state"] = dict(st)
-        
         data["positions"] = [dict(p) for p in c.execute("SELECT * FROM active_positions").fetchall()]
         data["closed_trades"] = [dict(t) for t in c.execute("SELECT * FROM closed_trades ORDER BY id ASC").fetchall()]
         data["logs"] = [dict(l) for l in c.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT 50").fetchall()]

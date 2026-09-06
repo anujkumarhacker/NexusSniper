@@ -11,6 +11,13 @@ class RiskGovernor:
         self.consecutive_losses = 0
         self.cb_locked_until = 0
 
+    # --- FIX 1: Recovery hook ---
+    def restore_state(self, peak_equity, consecutive_losses, cb_locked_until):
+        if peak_equity: self.peak_equity = peak_equity
+        if consecutive_losses: self.consecutive_losses = consecutive_losses
+        if cb_locked_until: self.cb_locked_until = cb_locked_until
+        state_store.log(f"Risk Governor Restored: Peak ${self.peak_equity:.2f} | {self.consecutive_losses} Losses")
+
     def sync_daily_anchors(self, current_equity):
         utc_now = datetime.now(timezone.utc)
         day_str = utc_now.strftime('%Y-%m-%d')

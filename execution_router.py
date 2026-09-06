@@ -43,16 +43,18 @@ class ExecutionRouter:
         try:
             order = await exchange.create_order(sym, 'LIMIT', order_side, float(qty_str), float(px_str), params={'timeInForce': 'GTC'})
             state_store.log(f"⚡ GTC Entry Deployed: {sym} {order_side.upper()} {qty_str} @ ${px_str}")
-            
-            # --- NEW: PUSH GTC ALERT TO TELEGRAM ---
             await telegram_notifier.send_alert(telegram_notifier.format_gtc_placed_alert(sym, side, float(px_str)))
             
-            return {
+            entry_dict = {
                 'order_id': order['id'], 'symbol': sym, 'side': side, 'size': float(qty_str),
                 'entry_price': float(px_str), 'stop_distance': stop_dist, 'initial_sl': setup['stop_loss'],
                 'target_5r': setup['target_5r'], 'target_tp': setup['target_price'],
                 'margin_locked': req_margin, 'leverage': allowed_lev, 'placed_time': time.time()
             }
+            # FIX 3: Push GTC to database persistence
+            state_store.save_pending_entry(entry_dict)
+            return entry_dict
+
         except Exception as e:
             state_store.log(f"GTC Entry Placement Failed for {sym}: {e}", "ERROR")
             return None
@@ -74,11 +76,13 @@ class ExecutionRouter:
                 try:
                     await self.mesh.rest_exchange.cancel_order(entry['order_id'], sym)
                     state_store.log(f"🚫 GTC Entry Revoked: {sym} - Reason: {cancel_reason}")
-                    # --- NEW: PUSH CANCEL ALERT TO TELEGRAM ---
                     await telegram_notifier.send_alert(telegram_notifier.format_gtc_cancelled_alert(sym, cancel_reason))
+                    
+                    # FIX 10: Only deregister locally if the cancel succeeds
+                    del pending_entries[sym]
+                    state_store.remove_pending_entry(sym)
                 except Exception as e:
                     state_store.log(f"Failed to cancel GTC order for {sym}: {e}", "WARN")
-                del pending_entries[sym]
 
     async def place_layered_stop(self, sym, side, size, sl_price, tier):
         opp_side = 'sell' if side == 'long' else 'buy'
@@ -93,6 +97,22 @@ class ExecutionRouter:
             return res['id']
         except Exception as e:
             state_store.log(f"Layered Stop Failed for {sym} [{tier}]: {e}", "ERROR")
+            return None
+
+    # FIX 9: Terminal Take Profit Real Order Logic
+    async def place_terminal_tp(self, sym, side, size, tp_price):
+        opp_side = 'sell' if side == 'long' else 'buy'
+        exchange = self.mesh.rest_exchange
+        tp_str = exchange.price_to_precision(sym, tp_price)
+        qty_str = exchange.amount_to_precision(sym, size)
+
+        try:
+            res = await exchange.create_order(sym, 'LIMIT', opp_side, float(qty_str), float(tp_str), params={'reduceOnly': True})
+            state_store.record_bracket_order(sym, res['id'], 'LIMIT', float(tp_str), "TERMINAL_TP")
+            state_store.log(f"🎯 Terminal 28R Take Profit Deployed: {sym} @ ${tp_str}")
+            return res['id']
+        except Exception as e:
+            state_store.log(f"Terminal TP Placement Failed for {sym}: {e}", "ERROR")
             return None
 
     async def sweep_orphan_orders(self, sym):

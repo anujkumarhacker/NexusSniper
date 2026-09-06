@@ -1,7 +1,3 @@
-"""
-NexusSniper (NP) - Smart Money Concepts (SMC) Tactical Engine
-Evaluates confirmed closed 15m candles ([-2]) for valid Turtle Soup liquidity sweeps.
-"""
 import numpy as np
 import pandas as pd
 import config
@@ -32,19 +28,16 @@ class SMCEngine:
             if df_1h.empty or df_15m.empty or df_1m.empty: return None
             if len(df_1h) < 7 or len(df_15m) < 15: return None 
                 
-            # 1. 1h Macro Trend Efficiency (evaluated on completed 1h bars)
             er_1h = cls.calculate_efficiency_ratio(df_1h['close'].iloc[:-1])
             if er_1h < config.ER_TREND_THRESHOLD: return None 
 
             c_1h = df_1h['close'].to_numpy()
             h1_bias = 1 if c_1h[-2] > c_1h[-7] else -1
 
-            # 2. 15m Turtle Soup Sweep on the CLOSED candle (iloc[-2])
             h_15m = df_15m['high'].to_numpy()
             l_15m = df_15m['low'].to_numpy()
             c_15m = df_15m['close'].to_numpy()
             
-            # Historical external liquidity pools prior to the closed candle
             sh_pools, sl_pools = cls.find_fractal_swings(h_15m[:-2], l_15m[:-2])
             
             closed_15m_high = h_15m[-2]
@@ -53,12 +46,11 @@ class SMCEngine:
 
             h_1m, l_1m = df_1m['high'].to_numpy(), df_1m['low'].to_numpy()
 
-            # Bullish Sweep: Closed 15m bar pierced liquidity pool and closed back inside
             if sl_pools and h1_bias >= 0:
                 target_low = min(sl_pools[-5:]) 
                 if closed_15m_low < target_low * (1.0 - config.SWEEP_MIN_DEPTH_PCT) and closed_15m_close > target_low:
-                    # Scan 1m candles for FVG: L[m] > H[m-2]
-                    for m in range(len(df_1m) - 1, max(len(df_1m) - 15, 2), -1):
+                    # FIX 7: Start scan at -2 to ignore forming candle
+                    for m in range(len(df_1m) - 2, max(len(df_1m) - 15, 2), -1):
                         if l_1m[m] > h_1m[m - 2]:
                             entry_price = l_1m[m]  
                             stop_loss = closed_15m_low * (1.0 - 0.0002)
@@ -70,12 +62,11 @@ class SMCEngine:
                                     'target_5r': entry_price + (risk_dist * config.GTC_RUNAWAY_R_MULTIPLE), 'er': er_1h
                                 }
 
-            # Bearish Sweep: Closed 15m bar pierced liquidity pool and closed back inside
             if sh_pools and h1_bias <= 0:
                 target_high = max(sh_pools[-5:])
                 if closed_15m_high > target_high * (1.0 + config.SWEEP_MIN_DEPTH_PCT) and closed_15m_close < target_high:
-                    # Scan 1m candles for Bearish FVG: H[m] < L[m-2]
-                    for m in range(len(df_1m) - 1, max(len(df_1m) - 15, 2), -1):
+                    # FIX 7: Start scan at -2 to ignore forming candle
+                    for m in range(len(df_1m) - 2, max(len(df_1m) - 15, 2), -1):
                         if h_1m[m] < l_1m[m - 2]:
                             entry_price = h_1m[m]
                             stop_loss = closed_15m_high * (1.0 + 0.0002)
