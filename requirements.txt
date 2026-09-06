@@ -1,0 +1,16 @@
+# Core Cryptocurrency Exchange Trading & WebSocket Streaming
+ccxt>=4.2.0           # Unified async trading client and native WebSocket streams
+
+# Asynchronous HTTP & Networking
+aiohttp>=3.9.0        # Fast asynchronous HTTP requests for Telegram webhooks & REST API
+
+# Data Science, Math & Microstructure Analytics
+pandas>=2.1.0         # High-performance dataframe structures for OHLCV processing
+numpy>=1.26.0         # Vectorized array math for fractal swing extremes and calculations
+
+# Telemetry Server & Dashboard
+fastapi>=0.109.0      # Asynchronous API framework hosting the C2 dashboard
+uvicorn>=0.27.0       # Lightning-fast ASGI web server implementation
+
+# Timezones & System
+pytz>=2023.3          # Global timezone conversions (UTC to IST and exchange clocks)
